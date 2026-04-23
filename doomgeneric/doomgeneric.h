@@ -24,7 +24,7 @@ typedef uint32_t pixel_t;
 #endif  // CMAP256
 
 
-extern pixel_t* DG_ScreenBuffer;
+extern uint16_t* DG_ScreenBuffer;
 
 #ifdef __cplusplus
 extern "C" {

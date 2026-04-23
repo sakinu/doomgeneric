@@ -55,8 +55,8 @@
 #include <CoreFoundation/CFUserNotification.h>
 #endif
 
-#define DEFAULT_RAM 6 /* MiB */
-#define MIN_RAM     6  /* MiB */
+#define DEFAULT_RAM 1 /* MiB */
+#define MIN_RAM     1  /* MiB */
 
 
 typedef struct atexit_listentry_s atexit_listentry_t;
@@ -101,31 +101,31 @@ static byte *AutoAllocMemory(int *size, int default_ram, int min_ram)
     // If we used the -mb command line parameter, only the parameter
     // provided is accepted.
 
-    zonemem = NULL;
+    *size = 512 * 1024;
+    zonemem = malloc(*size);
+    // while (zonemem == NULL)
+    // {
+    //     // We need a reasonable minimum amount of RAM to start.
 
-    while (zonemem == NULL)
-    {
-        // We need a reasonable minimum amount of RAM to start.
+    //     if (default_ram < min_ram)
+    //     {
+    //         I_Error("Unable to allocate %i MiB of RAM for zone", default_ram);
+    //     }
 
-        if (default_ram < min_ram)
-        {
-            I_Error("Unable to allocate %i MiB of RAM for zone", default_ram);
-        }
+    //     // Try to allocate the zone memory.
 
-        // Try to allocate the zone memory.
+    //     *size = default_ram * 1024 * 1024;
 
-        *size = default_ram * 1024 * 1024;
+    //     zonemem = malloc(*size);
 
-        zonemem = malloc(*size);
+    //     // Failed to allocate?  Reduce zone size until we reach a size
+    //     // that is acceptable.
 
-        // Failed to allocate?  Reduce zone size until we reach a size
-        // that is acceptable.
-
-        if (zonemem == NULL)
-        {
-            default_ram -= 1;
-        }
-    }
+    //     if (zonemem == NULL)
+    //     {
+    //         default_ram -= 1;
+    //     }
+    // }
 
     return zonemem;
 }
