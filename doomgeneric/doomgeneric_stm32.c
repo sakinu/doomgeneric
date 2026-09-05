@@ -26,7 +26,7 @@ void DG_Init()
     }
 
     
-    ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo);
+    ∂(fb_fd, FBIOGET_VSCREENINFO, &vinfo);
     ioctl(fb_fd, FBIOGET_FSCREENINFO, &finfo);
 
     fb_size = vinfo.xres * vinfo.yres * 2;

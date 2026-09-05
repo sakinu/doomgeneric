@@ -89,6 +89,10 @@ static struct color colors[256];
 
 #endif  // CMAP256
 
+/* palette index -> RGB565 LUT, rebuilt in I_SetPalette. Lets I_FinishUpdate do
+ * one halfword read per pixel instead of a 4-byte struct read + conversion. */
+static uint16_t in_to_rgb565[256];
+
 
 void I_GetEvent(void);
 
@@ -326,7 +330,12 @@ static inline uint16_t rgb888_to_rgb565(struct color c)
 // I_FinishUpdate
 //
 #include <linux/fb.h>
+#include <time.h>
 extern struct fb_fix_screeninfo finfo;
+extern void DG_DrawFrame(void);   /* backend present hook (page flip on DRM) */
+extern uint64_t g_rot_us;         /* perf: rotation/copy loop time (us) */
+
+int dg_x_offset = 20;   /* panel-column left margin of the rotated game (backend overrides) */
 
 void I_FinishUpdate (void)
 {
@@ -334,11 +343,44 @@ void I_FinishUpdate (void)
     uint16_t *line_out;
     line_in  = (uint8_t *) I_VideoBuffer;
     line_out = (uint16_t *) DG_ScreenBuffer;
-    for (int i = 0; i < SCREENHEIGHT; i++) {
-        for (int j = 0; j < SCREENWIDTH; j++) {
-            line_out[j * finfo.line_length / 2 + (-40 + finfo.line_length / 2 - 1 - i)] = rgb888_to_rgb565(colors[line_in[i * SCREENWIDTH + j]]);
+    /* Rotate DOOM 320x200 -> 200x320 for the 240-wide portrait panel. Both axes
+     * reversed vs. the naive map (the other 90-degree direction) so it isn't
+     * upside-down. dg_x_offset = left margin in panel columns: 20 centres it
+     * (standalone), 0 left-aligns it to [0..199] leaving [200..239] for buttons
+     * (cellphone app). Backends set dg_x_offset in DG_Init. */
+    const int stride = finfo.line_length / 2;   /* uint16 pixels per panel row */
+    struct timespec _ta, _tb;
+    clock_gettime(CLOCK_MONOTONIC, &_ta);
+    /* Iterate so the dumb-buffer WRITE is sequential (out[0..199] contiguous).
+     * The 90-degree rotation otherwise strides writes by one panel row, which
+     * kills write-combining on the WC-mapped framebuffer; here the strided
+     * access lands on cached RAM (the read) instead. Output is identical. */
+    for (int i = 0; i < SCREENHEIGHT; i += 2) {
+        uint32_t * line_in_ = (uint32_t *)(line_in + i * SCREENWIDTH);
+        for (int j = 0; j << 2 < SCREENWIDTH; j++) {        // uint32 = 4*uint8
+            uint32_t *p_in = line_in_ + j;
+            uint32_t in0_0 = in_to_rgb565[(*p_in)>>24];
+            uint32_t in0_1 = in_to_rgb565[(*p_in>>16)&255];
+            uint32_t in0_2 = in_to_rgb565[(*p_in>>8)&255];
+            uint32_t in0_3 = in_to_rgb565[(*p_in)&255];
+            p_in += SCREENWIDTH >> 2;
+            uint32_t in1_0 = in_to_rgb565[(*p_in)>>24];
+            uint32_t in1_1 = in_to_rgb565[(*p_in>>16)&255];
+            uint32_t in1_2 = in_to_rgb565[(*p_in>>8)&255];
+            uint32_t in1_3 = in_to_rgb565[(*p_in)&255];
+
+            uint16_t * p_out = line_out + (SCREENWIDTH - 1 - 4*j) * stride + dg_x_offset + i;
+            *(uint32_t *)(p_out            ) = (in1_3 << 16) | in0_3;  // col 4j+0
+            *(uint32_t *)(p_out -   stride ) = (in1_2 << 16) | in0_2;  // col 4j+1
+            *(uint32_t *)(p_out - 2*stride ) = (in1_1 << 16) | in0_1;  // col 4j+2
+            *(uint32_t *)(p_out - 3*stride ) = (in1_0 << 16) | in0_0;  // col 4j+3
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &_tb);
+    g_rot_us = (uint64_t)(_tb.tv_sec - _ta.tv_sec) * 1000000ull
+             + (_tb.tv_nsec - _ta.tv_nsec) / 1000;
+
+    DG_DrawFrame();          /* present the frame (page flip on the DRM backend) */
 }
 
 //
@@ -382,6 +424,7 @@ void I_SetPalette (byte* palette)
         colors[i].r = gammatable[usegamma][*palette++];
         colors[i].g = gammatable[usegamma][*palette++];
         colors[i].b = gammatable[usegamma][*palette++];
+        in_to_rgb565[i] = rgb888_to_rgb565(colors[i]);
     }
 
 #ifdef CMAP256

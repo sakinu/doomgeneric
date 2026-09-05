@@ -17,6 +17,8 @@
 //
 
 
+#include <sys/mman.h>
+
 #include "z_zone.h"
 #include "i_system.h"
 #include "doomtype.h"
@@ -118,11 +120,21 @@ static void Z_ZoneAdd(void *start, int size)
 //
 void Z_Init (void)
 {
+    /* no-MMU: each block must be one physically-contiguous buddy block. Use
+     * raw mmap (not malloc): mmap(256 KiB) maps exactly 64 pages (order-6),
+     * whereas malloc(256 KiB) adds a 20-byte header -> 256 KiB+ -> order-7 =
+     * 512 KiB physical (2x waste, and fails when no 512 KiB block exists).
+     * Z_Malloc already chains multiple zones, so grab several 256 KiB chunks. */
+    int z_mmap_num = 0;
     for (int i = 0; i < 10; i++) {
-        void *ptr = malloc(256 * 1024);
-        if (ptr)
-            Z_ZoneAdd(ptr, 256 * 1024);
+        void *ptr = mmap(NULL, 128 * 1024, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr != MAP_FAILED) {
+            Z_ZoneAdd(ptr, 128 * 1024);
+            z_mmap_num++;
+        }
     }
+    printf("Z_Init: %d zones x 128KB via mmap\n", z_mmap_num);
 }
 
 void Z_ZoneFree(memzone_t *zone, void *ptr)
