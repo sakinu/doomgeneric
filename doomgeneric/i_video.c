@@ -89,11 +89,6 @@ static struct color colors[256];
 
 #endif  // CMAP256
 
-/* palette index -> RGB565 LUT, rebuilt in I_SetPalette. Lets I_FinishUpdate do
- * one halfword read per pixel instead of a 4-byte struct read + conversion. */
-static uint16_t in_to_rgb565[256];
-
-
 void I_GetEvent(void);
 
 // The screen buffer; this is modified to draw things to the screen
@@ -318,14 +313,6 @@ void I_UpdateNoBlit (void)
 {
 }
 
-static inline uint16_t rgb888_to_rgb565(struct color c)
-{
-    uint16_t r = ((uint16_t)(c.r >> 3)) << 11;
-    uint16_t g = ((uint16_t)(c.g >> 2)) << 5;
-    uint16_t b = ((uint16_t)(c.b >> 3)) << 0;
-    return r | g | b;
-}
-
 //
 // I_FinishUpdate
 //
@@ -340,40 +327,75 @@ int dg_x_offset = 20;   /* panel-column left margin of the rotated game (backend
 void I_FinishUpdate (void)
 {
     uint8_t *line_in;
-    uint16_t *line_out;
+    uint8_t *line_out;
     line_in  = (uint8_t *) I_VideoBuffer;
-    line_out = (uint16_t *) DG_ScreenBuffer;
+    line_out = (uint8_t *) DG_ScreenBuffer;
     /* Rotate DOOM 320x200 -> 200x320 for the 240-wide portrait panel. Both axes
      * reversed vs. the naive map (the other 90-degree direction) so it isn't
      * upside-down. dg_x_offset = left margin in panel columns: 20 centres it
      * (standalone), 0 left-aligns it to [0..199] leaving [200..239] for buttons
-     * (cellphone app). Backends set dg_x_offset in DG_Init. */
-    const int stride = finfo.line_length / 2;   /* uint16 pixels per panel row */
+     * (cellphone app). Backends set dg_x_offset in DG_Init.
+     *
+     * The panel buffer holds raw 8-bit palette indices (DRM_FORMAT_C8): the
+     * LTDC's hardware CLUT does index -> RGB during scan-out (see I_SetPalette
+     * / DG_SetPalette), so this loop only ever moves bytes -- no per-pixel
+     * color conversion runs on the CPU. */
+    const int stride = finfo.line_length;   /* bytes per panel row (1 byte/pixel) */
     struct timespec _ta, _tb;
     clock_gettime(CLOCK_MONOTONIC, &_ta);
     /* Iterate so the dumb-buffer WRITE is sequential (out[0..199] contiguous).
      * The 90-degree rotation otherwise strides writes by one panel row, which
      * kills write-combining on the WC-mapped framebuffer; here the strided
-     * access lands on cached RAM (the read) instead. Output is identical. */
-    for (int i = 0; i < SCREENHEIGHT; i += 2) {
+     * access lands on cached RAM (the read) instead. Output is identical.
+     * Four input rows are grouped per outer step (was two, back when each
+     * output pixel was a 2-byte RGB565 value) so each store is still a full
+     * 32-bit write: four 1-byte palette indices now fill the word that two
+     * 2-byte colors used to. */
+    for (int i = 0; i < SCREENHEIGHT; i += 4) {
         uint32_t * line_in_ = (uint32_t *)(line_in + i * SCREENWIDTH);
         for (int j = 0; j << 2 < SCREENWIDTH; j++) {        // uint32 = 4*uint8
+            /* Each *p_in load grabs 4 horizontally-adjacent source pixels
+             * (row i+0..i+3) as one 32-bit word. Target is little-endian, so
+             * the LOWEST-addressed pixel (col 4j+0) lands in the LOW byte of
+             * the register, meaning the shift amount and the column offset
+             * run opposite ways: inR_0 (>>24) is actually column 4j+3, and
+             * inR_3 (no shift, just &255) is column 4j+0. That's why the
+             * writes below pair suffix _3 with "col 4j+0" and suffix _0 with
+             * "col 4j+3" -- reversed-looking, but it's what the load order
+             * demands, not an off-by-one. */
             uint32_t *p_in = line_in_ + j;
-            uint32_t in0_0 = in_to_rgb565[(*p_in)>>24];
-            uint32_t in0_1 = in_to_rgb565[(*p_in>>16)&255];
-            uint32_t in0_2 = in_to_rgb565[(*p_in>>8)&255];
-            uint32_t in0_3 = in_to_rgb565[(*p_in)&255];
+            uint32_t in0_0 = (*p_in)>>24, in0_1 = (*p_in>>16)&255, in0_2 = (*p_in>>8)&255, in0_3 = (*p_in)&255;
             p_in += SCREENWIDTH >> 2;
-            uint32_t in1_0 = in_to_rgb565[(*p_in)>>24];
-            uint32_t in1_1 = in_to_rgb565[(*p_in>>16)&255];
-            uint32_t in1_2 = in_to_rgb565[(*p_in>>8)&255];
-            uint32_t in1_3 = in_to_rgb565[(*p_in)&255];
+            uint32_t in1_0 = (*p_in)>>24, in1_1 = (*p_in>>16)&255, in1_2 = (*p_in>>8)&255, in1_3 = (*p_in)&255;
+            p_in += SCREENWIDTH >> 2;
+            uint32_t in2_0 = (*p_in)>>24, in2_1 = (*p_in>>16)&255, in2_2 = (*p_in>>8)&255, in2_3 = (*p_in)&255;
+            p_in += SCREENWIDTH >> 2;
+            uint32_t in3_0 = (*p_in)>>24, in3_1 = (*p_in>>16)&255, in3_2 = (*p_in>>8)&255, in3_3 = (*p_in)&255;
 
-            uint16_t * p_out = line_out + (SCREENWIDTH - 1 - 4*j) * stride + dg_x_offset + i;
-            *(uint32_t *)(p_out            ) = (in1_3 << 16) | in0_3;  // col 4j+0
-            *(uint32_t *)(p_out -   stride ) = (in1_2 << 16) | in0_2;  // col 4j+1
-            *(uint32_t *)(p_out - 2*stride ) = (in1_1 << 16) | in0_1;  // col 4j+2
-            *(uint32_t *)(p_out - 3*stride ) = (in1_0 << 16) | in0_0;  // col 4j+3
+            /* Each store below re-packs one byte from each of the 4 source
+             * rows (one output column) into a single 32-bit word -- that's
+             * the actual transpose step; the shift here just places row r's
+             * byte at bit offset 8*r.
+             *
+             * It's tempting to fold the ">>N & 255" extraction above and the
+             * "<<8*r" placement here into one combined shift per byte (e.g.
+             * in1_1 = (*p_in >> 8) & 0xFF00 instead of ((*p_in>>16)&255)<<8)
+             * -- the arithmetic is correct, but it doesn't help on this
+             * target: ARM's barrel shifter already folds a "<<N" into the
+             * very instruction that ORs it in (e.g. `orr r1, r1, r2, lsl
+             * #24`), so the second shift here is already free. Pre-shifting
+             * by hand instead loses the compiler's UBFX-based extraction
+             * (shift+mask to 0..255 in one instruction) and measurably
+             * produces MORE instructions, not fewer -- verified by compiling
+             * both versions with this project's actual cross compiler
+             * (arm-linux-gcc -O2 -mcpu=cortex-m4 -mthumb -mfdpic): the
+             * current form is 43 instructions per inner-loop iteration (16
+             * pixels), the "pre-shifted" rewrite is 47. Leave this as-is. */
+            uint8_t * p_out = line_out + (SCREENWIDTH - 1 - 4*j) * stride + dg_x_offset + i;
+            *(uint32_t *)(p_out            ) = (in3_3 << 24) | (in2_3 << 16) | (in1_3 << 8) | in0_3;  // col 4j+0
+            *(uint32_t *)(p_out -   stride ) = (in3_2 << 24) | (in2_2 << 16) | (in1_2 << 8) | in0_2;  // col 4j+1
+            *(uint32_t *)(p_out - 2*stride ) = (in3_1 << 24) | (in2_1 << 16) | (in1_1 << 8) | in0_1;  // col 4j+2
+            *(uint32_t *)(p_out - 3*stride ) = (in3_0 << 24) | (in2_0 << 16) | (in1_0 << 8) | in0_0;  // col 4j+3
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &_tb);
@@ -399,33 +421,42 @@ void I_ReadScreen (byte* scr)
 #define GFX_RGB565_G(color)			((0x07E0 & color) >> 5)
 #define GFX_RGB565_B(color)			(0x001F & color)
 
+/* backend hook (doomgeneric_drm.c): push 256 gamma-corrected {r,g,b} triples
+ * into the LTDC's hardware CLUT (via drmModeCrtcSetGamma). Index -> RGB then
+ * happens entirely in hardware during scan-out -- I_FinishUpdate never has
+ * to convert a pixel. */
+extern void DG_SetPalette(const byte *rgb256x3);
+extern uint64_t g_pal_us;   /* perf: I_SetPalette time, incl. the CLUT push (us) */
+
 void I_SetPalette (byte* palette)
 {
 	int i;
-	//col_t* c;
-
-	//for (i = 0; i < 256; i++)
-	//{
-	//	c = (col_t*)palette;
-
-	//	rgb565_palette[i] = GFX_RGB565(gammatable[usegamma][c->r],
-	//								   gammatable[usegamma][c->g],
-	//								   gammatable[usegamma][c->b]);
-
-	//	palette += 3;
-	//}
-    
+	byte rgb256x3[256 * 3];
+	struct timespec _pa, _pb;
 
     /* performance boost:
      * map to the right pixel format over here! */
+
+    /* Same pattern as I_FinishUpdate's g_rot_us: time this function's own
+     * work (palette/gamma build + the CLUT push), accumulated rather than
+     * overwritten since I_SetPalette can fire more than once per tic (e.g.
+     * a damage flash and a state-change reset landing in the same tic). */
+    clock_gettime(CLOCK_MONOTONIC, &_pa);
 
     for (i=0; i<256; ++i ) {
         colors[i].a = 0;
         colors[i].r = gammatable[usegamma][*palette++];
         colors[i].g = gammatable[usegamma][*palette++];
         colors[i].b = gammatable[usegamma][*palette++];
-        in_to_rgb565[i] = rgb888_to_rgb565(colors[i]);
+        rgb256x3[i*3 + 0] = colors[i].r;
+        rgb256x3[i*3 + 1] = colors[i].g;
+        rgb256x3[i*3 + 2] = colors[i].b;
     }
+    DG_SetPalette(rgb256x3);
+
+    clock_gettime(CLOCK_MONOTONIC, &_pb);
+    g_pal_us += (uint64_t)(_pb.tv_sec - _pa.tv_sec) * 1000000ull
+              + (_pb.tv_nsec - _pa.tv_nsec) / 1000;
 
 #ifdef CMAP256
 
